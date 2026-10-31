@@ -24,10 +24,15 @@ pub struct Textures {
     pub signed: bool,
 }
 
-/// The `getTexture` endpoint's valid URIs from Minecraft services discovery.
-pub const TEXTURE_URIS: [&str; 2] = [
+/// The `getTexture` endpoint's valid URIs from Minecraft services discovery,
+/// plus Ely.by's skin service URLs.
+pub const TEXTURE_URIS: [&str; 6] = [
     "https://textures.minecraft.net/texture/{textureId}",
     "http://textures.minecraft.net/texture/{textureId}",
+    "https://skinsystem.ely.by/textures/{textureId}",
+    "http://skinsystem.ely.by/textures/{textureId}",
+    "https://skin.ely.by/textures/{textureId}",
+    "http://skin.ely.by/textures/{textureId}",
 ];
 
 /// `java.util.Base64.getDecoder().decode`.
@@ -202,25 +207,7 @@ fn valid_player_name(name: &str) -> bool {
     name.encode_utf16().count() <= 16 && name.encode_utf16().all(|c| c > 32 && c < 127)
 }
 
-/// `fetchByNameOrId`: `getByName` answers `{id, name}`; `getProfileById`
-/// (`fetchProfile(id, requireSecure)`) answers `{id, name, properties}` —
-/// asked `unsigned=false` so the `textures` property is signed.
-fn resolve_profile(key: &NameOrId, doc: &serde_json::Value) -> Option<ResolvedProfile> {
-    let id = match key {
-        NameOrId::Id(id) => *id,
-        NameOrId::Name(name) => {
-            let url = crate::auth::endpoint(doc, "profiles", "getByName")?
-                .replace("{name}", &name.to_lowercase());
-            let body = http_get(&url)?;
-            let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
-            crate::auth::parse_uuid(v.get("id")?.as_str()?)?
-        }
-    };
-    let url = crate::auth::endpoint(doc, "session", "getProfileById")?
-        .replace("{profileId}", &format!("{id:032x}"));
-    let separator = if url.contains('?') { '&' } else { '?' };
-    let body = http_get(&format!("{url}{separator}unsigned=false"))?;
-    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+fn parse_resolved_profile_json(v: &serde_json::Value) -> Option<ResolvedProfile> {
     Some(ResolvedProfile {
         id: crate::auth::parse_uuid(v.get("id")?.as_str()?)?,
         name: v.get("name")?.as_str()?.to_owned(),
@@ -239,6 +226,49 @@ fn resolve_profile(key: &NameOrId, doc: &serde_json::Value) -> Option<ResolvedPr
             })
             .collect::<Option<Vec<_>>>()?,
     })
+}
+
+fn resolve_elyby_profile(key: &NameOrId) -> Option<ResolvedProfile> {
+    let url = match key {
+        NameOrId::Name(name) => {
+            format!("https://authlib-injector.ely.by/api/users/profiles/minecraft/{name}")
+        }
+        NameOrId::Id(id) => {
+            format!("https://authlib-injector.ely.by/api/sessionserver/session/minecraft/profile/{id:032x}")
+        }
+    };
+    let body = http_get(&url)?;
+    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    parse_resolved_profile_json(&v)
+}
+
+/// `fetchByNameOrId`: `getByName` answers `{id, name}`; `getProfileById`
+/// (`fetchProfile(id, requireSecure)`) answers `{id, name, properties}` —
+/// asked `unsigned=false` so the `textures` property is signed.
+/// Falls back to Ely.by authlib-injector profile resolution when Mojang does not have it.
+fn resolve_profile(key: &NameOrId, doc: &serde_json::Value) -> Option<ResolvedProfile> {
+    let mojang = (|| {
+        let id = match key {
+            NameOrId::Id(id) => *id,
+            NameOrId::Name(name) => {
+                let url = crate::auth::endpoint(doc, "profiles", "getByName")?
+                    .replace("{name}", &name.to_lowercase());
+                let body = http_get(&url)?;
+                let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+                crate::auth::parse_uuid(v.get("id")?.as_str()?)?
+            }
+        };
+        let url = crate::auth::endpoint(doc, "session", "getProfileById")?
+            .replace("{profileId}", &format!("{id:032x}"));
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let body = http_get(&format!("{url}{separator}unsigned=false"))?;
+        let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+        parse_resolved_profile_json(&v)
+    })();
+    if mojang.is_some() {
+        return mojang;
+    }
+    resolve_elyby_profile(key)
 }
 
 impl Default for Resolver {
@@ -984,6 +1014,17 @@ mod tests {
         );
         assert!(t.slim);
         assert!(!unpack(wide, Signature::Signed, &TEXTURE_URIS).slim);
+    }
+    #[test]
+    fn elyby_textures_are_allowed_and_unpacked() {
+        use super::{Signature, TEXTURE_URIS, unpack};
+        let ely_payload = "eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHBzOi8vc2tpbnN5c3RlbS5lbHkuYnkvdGV4dHVyZXMvMTIzNDU2NzgiLCJtZXRhZGF0YSI6eyJtb2RlbCI6InNsaW0ifX19fQ==";
+        let t = unpack(ely_payload, Signature::Signed, &TEXTURE_URIS);
+        assert_eq!(
+            t.skin.as_deref(),
+            Some("https://skinsystem.ely.by/textures/12345678")
+        );
+        assert!(t.slim);
     }
     #[test]
     fn profiles_parse_like_resolvable_profiles() {

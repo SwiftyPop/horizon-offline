@@ -797,15 +797,7 @@ impl Launcher {
                         let mut cmd = backend::client_command(&tag);
                         let (file, offline) = match session {
                             Ok(pass) => pass,
-                            Err(account::NoOwner) => {
-                                self.owner = Some(false);
-                                self.owner_screen_open = true;
-                                self.client_error = Some(format!("{}.", tr(account::NEEDS_OWNER)));
-                                self.starting_pack = None;
-                                self.joining = None;
-                                self.quick_play = None;
-                                continue;
-                            }
+                            Err(account::NoOwner) => (None, None),
                         };
                         // Past the gate by the developer option alone is no owner.
                         if !self.settings.dev_offline {
@@ -1336,7 +1328,7 @@ impl Launcher {
         self.starting_client = Some(tag.clone());
         self.play_pressed = Some(Instant::now());
         let tx = self.tx.clone();
-        let offline_without_owner = self.settings.dev_offline;
+        let offline_without_owner = true;
         std::thread::spawn(move || {
             backend::complete_assets(&tag);
             let session = account::session_for_game(&backend::game_home(), offline_without_owner);
@@ -1775,12 +1767,11 @@ enum PlayPress {
 }
 
 /// `owner`: whether an account here owns the game, by the keychain (`Launcher::owner`).
-fn play_press(prepared: bool, owner: Option<bool>, busy: bool) -> PlayPress {
-    match (prepared, owner) {
+fn play_press(prepared: bool, _owner: Option<bool>, busy: bool) -> PlayPress {
+    match prepared {
         _ if busy => PlayPress::Nothing,
-        (true, _) => PlayPress::Play,
-        (false, Some(true)) => PlayPress::PrepareThenPlay,
-        (false, _) => PlayPress::Nothing,
+        true => PlayPress::Play,
+        false => PlayPress::PrepareThenPlay,
     }
 }
 

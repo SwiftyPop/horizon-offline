@@ -1,0 +1,723 @@
+diff --git a/crates/horizon-client-render/src/skins.rs b/crates/horizon-client-render/src/skins.rs
+index 0a408c15f3..6312e4dcd0 100644
+--- a/crates/horizon-client-render/src/skins.rs
++++ b/crates/horizon-client-render/src/skins.rs
+@@ -24,10 +24,15 @@ pub struct Textures {
+     pub signed: bool,
+ }
+ 
+-/// The `getTexture` endpoint's valid URIs from Minecraft services discovery.
+-pub const TEXTURE_URIS: [&str; 2] = [
++/// The `getTexture` endpoint's valid URIs from Minecraft services discovery,
++/// plus Ely.by's skin service URLs.
++pub const TEXTURE_URIS: [&str; 6] = [
+     "https://textures.minecraft.net/texture/{textureId}",
+     "http://textures.minecraft.net/texture/{textureId}",
++    "https://skinsystem.ely.by/textures/{textureId}",
++    "http://skinsystem.ely.by/textures/{textureId}",
++    "https://skin.ely.by/textures/{textureId}",
++    "http://skin.ely.by/textures/{textureId}",
+ ];
+ 
+ /// `java.util.Base64.getDecoder().decode`.
+@@ -202,25 +207,7 @@ fn valid_player_name(name: &str) -> bool {
+     name.encode_utf16().count() <= 16 && name.encode_utf16().all(|c| c > 32 && c < 127)
+ }
+ 
+-/// `fetchByNameOrId`: `getByName` answers `{id, name}`; `getProfileById`
+-/// (`fetchProfile(id, requireSecure)`) answers `{id, name, properties}` —
+-/// asked `unsigned=false` so the `textures` property is signed.
+-fn resolve_profile(key: &NameOrId, doc: &serde_json::Value) -> Option<ResolvedProfile> {
+-    let id = match key {
+-        NameOrId::Id(id) => *id,
+-        NameOrId::Name(name) => {
+-            let url = crate::auth::endpoint(doc, "profiles", "getByName")?
+-                .replace("{name}", &name.to_lowercase());
+-            let body = http_get(&url)?;
+-            let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+-            crate::auth::parse_uuid(v.get("id")?.as_str()?)?
+-        }
+-    };
+-    let url = crate::auth::endpoint(doc, "session", "getProfileById")?
+-        .replace("{profileId}", &format!("{id:032x}"));
+-    let separator = if url.contains('?') { '&' } else { '?' };
+-    let body = http_get(&format!("{url}{separator}unsigned=false"))?;
+-    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
++fn parse_resolved_profile_json(v: &serde_json::Value) -> Option<ResolvedProfile> {
+     Some(ResolvedProfile {
+         id: crate::auth::parse_uuid(v.get("id")?.as_str()?)?,
+         name: v.get("name")?.as_str()?.to_owned(),
+@@ -241,6 +228,49 @@ fn resolve_profile(key: &NameOrId, doc: &serde_json::Value) -> Option<ResolvedPr
+     })
+ }
+ 
++fn resolve_elyby_profile(key: &NameOrId) -> Option<ResolvedProfile> {
++    let url = match key {
++        NameOrId::Name(name) => {
++            format!("https://authlib-injector.ely.by/api/users/profiles/minecraft/{name}")
++        }
++        NameOrId::Id(id) => {
++            format!("https://authlib-injector.ely.by/api/sessionserver/session/minecraft/profile/{id:032x}")
++        }
++    };
++    let body = http_get(&url)?;
++    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
++    parse_resolved_profile_json(&v)
++}
++
++/// `fetchByNameOrId`: `getByName` answers `{id, name}`; `getProfileById`
++/// (`fetchProfile(id, requireSecure)`) answers `{id, name, properties}` —
++/// asked `unsigned=false` so the `textures` property is signed.
++/// Falls back to Ely.by authlib-injector profile resolution when Mojang does not have it.
++fn resolve_profile(key: &NameOrId, doc: &serde_json::Value) -> Option<ResolvedProfile> {
++    let mojang = (|| {
++        let id = match key {
++            NameOrId::Id(id) => *id,
++            NameOrId::Name(name) => {
++                let url = crate::auth::endpoint(doc, "profiles", "getByName")?
++                    .replace("{name}", &name.to_lowercase());
++                let body = http_get(&url)?;
++                let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
++                crate::auth::parse_uuid(v.get("id")?.as_str()?)?
++            }
++        };
++        let url = crate::auth::endpoint(doc, "session", "getProfileById")?
++            .replace("{profileId}", &format!("{id:032x}"));
++        let separator = if url.contains('?') { '&' } else { '?' };
++        let body = http_get(&format!("{url}{separator}unsigned=false"))?;
++        let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
++        parse_resolved_profile_json(&v)
++    })();
++    if mojang.is_some() {
++        return mojang;
++    }
++    resolve_elyby_profile(key)
++}
++
+ impl Default for Resolver {
+     fn default() -> Self {
+         Self::new()
+@@ -986,6 +1016,17 @@ mod tests {
+         assert!(!unpack(wide, Signature::Signed, &TEXTURE_URIS).slim);
+     }
+     #[test]
++    fn elyby_textures_are_allowed_and_unpacked() {
++        use super::{Signature, TEXTURE_URIS, unpack};
++        let ely_payload = "eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHBzOi8vc2tpbnN5c3RlbS5lbHkuYnkvdGV4dHVyZXMvMTIzNDU2NzgiLCJtZXRhZGF0YSI6eyJtb2RlbCI6InNsaW0ifX19fQ==";
++        let t = unpack(ely_payload, Signature::Signed, &TEXTURE_URIS);
++        assert_eq!(
++            t.skin.as_deref(),
++            Some("https://skinsystem.ely.by/textures/12345678")
++        );
++        assert!(t.slim);
++    }
++    #[test]
+     fn profiles_parse_like_resolvable_profiles() {
+         use super::{NameOrId, Signature, parse_profile};
+         // A bare name is `createUnresolved`: dynamic by name, and its partial
+diff --git a/crates/horizon-client/src/game/perspective.rs b/crates/horizon-client/src/game/perspective.rs
+index d937584bc4..db87d43eb7 100644
+--- a/crates/horizon-client/src/game/perspective.rs
++++ b/crates/horizon-client/src/game/perspective.rs
+@@ -375,17 +375,40 @@ impl Game<'_> {
+             .as_mut()
+             .and_then(|p| p.attribute("minecraft:scale").ok())
+             .unwrap_or(1.0) as f32;
+-        let Some(p) = self.player.as_ref() else {
++        if self.player.is_none() {
+             self.player_model = None;
+             return;
++        }
++        if let Ok(skin_path) = std::env::var("HORIZON_OFFLINE_SKIN") {
++            let location = "skins/local_offline".to_string();
++            if !self.gui.atlas.sprites.contains_key(&location) {
++                if let Ok(bytes) = std::fs::read(&skin_path) {
++                    if let Ok((w, h, rgba)) = horizon_client::hud::decode_bytes(&bytes) {
++                        if let Some(processed) = horizon_client::skins::process_legacy_skin(w, h, &rgba) {
++                            self.store_skin(location.clone(), processed);
++                        }
++                    }
++                }
++            }
++        }
++        let Some(p) = self.player.as_ref() else {
++            return;
+         };
+         if self.player_model.is_none() {
+             let Some(kind) = self.res.player_type().clone() else {
+                 return;
+             };
+-            let mut m = Mob::new(0, kind, p.position, self.yaw);
+-            m.head_pitch = self.pitch;
+-            self.player_model = Some(m);
++            let mut mob = Mob::new(0, kind, p.position, self.yaw);
++            mob.head_pitch = self.pitch;
++            let location = "skins/local_offline";
++            if self.gui.atlas.sprites.contains_key(location) {
++                let slim = std::env::var("HORIZON_OFFLINE_SKIN_MODEL")
++                    .map(|m| m == "slim")
++                    .unwrap_or(false);
++                mob.skin = Some(location.to_string());
++                mob.slim = slim;
++            }
++            self.player_model = Some(mob);
+         }
+         let pose = p.pose;
+         let crouching = pose == Pose::Crouching;
+diff --git a/crates/horizon-client/src/game/remote.rs b/crates/horizon-client/src/game/remote.rs
+index 5105b600ad..ed5091bdb0 100644
+--- a/crates/horizon-client/src/game/remote.rs
++++ b/crates/horizon-client/src/game/remote.rs
+@@ -4139,7 +4139,6 @@ impl Game<'_> {
+             .collect();
+         Some((players, r.online_mode, upside_down))
+     }
+-
+     /// Resolve inline `object:player` profiles through the same skin cache as
+     /// player heads on items. The next frame uses the uploaded atlas texture.
+     pub(super) fn resolve_inline_profiles(&mut self, profiles: &[serde_json::Value]) {
+@@ -4178,19 +4177,30 @@ impl Game<'_> {
+             }
+         }
+     }
+-    /// The signed-in account's `textures`, once the services answered.
++    /// The signed-in or offline account's `textures`, once the services answered.
+     fn own_textures(&self) -> Option<horizon_client::skins::Textures> {
+         use horizon_client::skins::{self, NameOrId, Resolve};
+-        let auth = horizon_client::auth::current()?;
++        let (key, unsigned_ok) = match horizon_client::auth::current() {
++            Some(auth) => (NameOrId::Id(auth.uuid), false),
++            None => {
++                let name = self.options.player_name();
++                (NameOrId::Name(name), true)
++            }
++        };
+         let state = self
+             .skin_profiles
+             .borrow_mut()
+-            .state(&NameOrId::Id(auth.uuid));
++            .state(&key);
+         let Resolve::Done(Some(profile)) = state else {
+             return None;
+         };
+         let (value, signature) = profile.textures()?;
+-        Some(skins::unpack(&value, signature, &skins::TEXTURE_URIS))
++        let sig = if unsigned_ok && signature == skins::Signature::Unsigned {
++            skins::Signature::Signed
++        } else {
++            signature
++        };
++        Some(skins::unpack(&value, sig, &skins::TEXTURE_URIS))
+     }
+     /// `PlayerInfo.getSkin` for every player entity, including NPCs that are
+     /// never in the tab list: resolve each profile's textures and give the
+@@ -4302,8 +4312,31 @@ impl Game<'_> {
+             mob.slim = is_slim;
+             mob.cape = cape;
+         }
++        let mut offline_skin = None;
++        if skins.get(&own).is_none() && let Ok(skin_path) = std::env::var("HORIZON_OFFLINE_SKIN") {
++            let location = "skins/local_offline".to_string();
++            if !self.gui.atlas.sprites.contains_key(&location) {
++                if let Ok(bytes) = std::fs::read(&skin_path) {
++                    if let Ok((w, h, rgba)) = horizon_client::hud::decode_bytes(&bytes) {
++                        if let Some(processed) = horizon_client::skins::process_legacy_skin(w, h, &rgba) {
++                            self.store_skin(location.clone(), processed);
++                        }
++                    }
++                }
++            }
++            if self.gui.atlas.sprites.contains_key(&location) {
++                let slim = std::env::var("HORIZON_OFFLINE_SKIN_MODEL")
++                    .map(|m| m == "slim")
++                    .unwrap_or(false);
++                offline_skin = Some((location, slim));
++            }
++        }
+         if self.player_model.is_some() {
+-            let (skin, is_slim) = self.drawn_skin(own, skin_of(&skins, own));
++            let (skin, is_slim) = if let Some((loc, slim)) = offline_skin {
++                (loc, slim)
++            } else {
++                self.drawn_skin(own, skin_of(&skins, own))
++            };
+             // Avatar.isModelPartShown(CAPE): the Skin Customization option.
+             let cape = capes
+                 .get(&own)
+diff --git a/crates/horizon-client/src/game/scoreboard.rs b/crates/horizon-client/src/game/scoreboard.rs
+index 7f54866cc6..37b459401e 100644
+--- a/crates/horizon-client/src/game/scoreboard.rs
++++ b/crates/horizon-client/src/game/scoreboard.rs
+@@ -696,7 +696,11 @@ impl Game<'_> {
+                 });
+                 let mut me = TabPlayer::new(uuid, PLAYER_NAME);
+                 me.game_mode = self.mode_id();
+-                me.skin = "entity/player/wide/steve".into();
++                me.skin = if self.gui.atlas.sprites.contains_key("skins/local_offline") {
++                    "skins/local_offline".into()
++                } else {
++                    "entity/player/wide/steve".into()
++                };
+                 let guests = self.lan.as_ref().map_or(&[][..], |h| &h.hub.guests);
+                 let players = local_tab_players(me, guests);
+                 let upside_down = players
+diff --git a/crates/horizon-prepare/src/artifacts.rs b/crates/horizon-prepare/src/artifacts.rs
+index 533da0ccea..90c4352205 100644
+--- a/crates/horizon-prepare/src/artifacts.rs
++++ b/crates/horizon-prepare/src/artifacts.rs
+@@ -192,6 +192,39 @@ fn layouts(folder: &Path, version: &str) -> [GameFiles; 2] {
+ fn launcher_folders() -> Vec<(&'static str, PathBuf)> {
+     let mut folders = vec![("the official launcher", minecraft_dir(None))];
+     // The same folders as the Horizon launcher's (launcher/src/sources.rs `known_folders`).
++    let prism_launchers: Vec<(&'static str, PathBuf)> = if cfg!(target_os = "macos") {
++        let app_support = home().join("Library/Application Support");
++        vec![
++            ("Prism Launcher", app_support.join("PrismLauncher")),
++            ("ElyPrismLauncher", app_support.join("ElyPrismLauncher")),
++            ("PineconeMC", app_support.join("PineconeMC")),
++        ]
++    } else if cfg!(windows) {
++        std::env::var_os("APPDATA")
++            .map(|d| {
++                let p = PathBuf::from(d);
++                vec![
++                    ("Prism Launcher", p.join("PrismLauncher")),
++                    ("ElyPrismLauncher", p.join("ElyPrismLauncher")),
++                    ("PineconeMC", p.join("PineconeMC")),
++                ]
++            })
++            .unwrap_or_default()
++    } else {
++        let data = std::env::var_os("XDG_DATA_HOME")
++            .filter(|d| !d.is_empty())
++            .map_or_else(|| home().join(".local/share"), PathBuf::from);
++        let flatpak = |app: &str| home().join(".var/app").join(app).join("data");
++        vec![
++            ("Prism Launcher", data.join("PrismLauncher")),
++            ("ElyPrismLauncher", data.join("ElyPrismLauncher")),
++            ("PineconeMC", data.join("PineconeMC")),
++            ("Prism Launcher", flatpak("org.prismlauncher.PrismLauncher").join("PrismLauncher")),
++            ("ElyPrismLauncher", flatpak("org.prismlauncher.ElyPrismLauncher").join("ElyPrismLauncher")),
++            ("PineconeMC", flatpak("org.prismlauncher.PineconeMC").join("PineconeMC")),
++        ]
++    };
++    folders.extend(prism_launchers);
+     let atlauncher: Vec<PathBuf> = if cfg!(target_os = "macos") {
+         let app = Path::new("Applications/ATLauncher.app/Contents/Java");
+         vec![
+diff --git a/launcher/src/account.rs b/launcher/src/account.rs
+index 848b3066ab..3ea4b8cbcd 100644
+--- a/launcher/src/account.rs
++++ b/launcher/src/account.rs
+@@ -912,9 +912,6 @@ pub enum Player {
+     GameName,
+ }
+ 
+-const OFFLINE_NEEDS_OWNER: &str =
+-    "Offline names need a Microsoft account that owns Minecraft: Java Edition in the launcher.";
+-
+ /// The secrets an account keeps in `store`, if it still has them there.
+ fn secrets_in(store: &dyn SecretStore, uuid: &str) -> Option<Secrets> {
+     store
+@@ -1005,9 +1002,9 @@ impl Accounts {
+     /// the game.
+     pub fn play_as_with(
+         &mut self,
+-        store: &dyn SecretStore,
++        _store: &dyn SecretStore,
+         who: Player,
+-        offline_without_owner: bool,
++        _offline_without_owner: bool,
+     ) -> Result<(), String> {
+         match who {
+             Player::Microsoft(uuid) => {
+@@ -1017,9 +1014,6 @@ impl Accounts {
+                 self.selected = Some(uuid);
+             }
+             Player::Offline(name) => {
+-                if !offline_without_owner && !self.has_owner(store) {
+-                    return Err(OFFLINE_NEEDS_OWNER.into());
+-                }
+                 let name = self.add_offline(&name)?;
+                 self.selected = None;
+                 self.offline_selected = Some(name);
+@@ -1215,19 +1209,16 @@ pub fn launch(
+     }
+ }
+ 
+-/// The owner gate before the game starts. With the window's hidden developer option
+-/// (`backend::Settings::dev_offline`, `offline_without_owner`) no owner is no refusal: the game
+-/// starts offline, without a session and without an `owner`. Downloads never come through here:
+-/// `backend::download_for_owner` asks [`launch`] itself, so the option never downloads the game.
++/// The owner gate before the game starts. Offline play is always permitted without an owner.
+ pub fn launch_for_game(
+     ep: &Endpoints,
+     client_id: Option<&str>,
+     store: &dyn SecretStore,
+     accounts: &mut Accounts,
+-    offline_without_owner: bool,
++    _offline_without_owner: bool,
+ ) -> Result<Launch, NoOwner> {
+     match launch(ep, client_id, store, accounts) {
+-        Err(NoOwner) if offline_without_owner => Ok(Launch::default()),
++        Err(NoOwner) => Ok(Launch::default()),
+         pass => pass,
+     }
+ }
+diff --git a/launcher/src/account/tests.rs b/launcher/src/account/tests.rs
+index 2a62c57171..078bcb7d65 100644
+--- a/launcher/src/account/tests.rs
++++ b/launcher/src/account/tests.rs
+@@ -514,41 +514,28 @@ fn any_owner_opens_the_gate_and_the_one_who_plays_brings_the_session() {
+ }
+ 
+ #[test]
+-fn offline_names_play_only_beside_an_owner() {
++fn offline_names_play_without_an_owner() {
+     let store = MemoryStore::default();
+     let mut accounts = Accounts::default();
+-    let refused = accounts.play_as(&store, Player::Offline("Builder_1".into()));
+-    assert_eq!(refused.unwrap_err(), OFFLINE_NEEDS_OWNER);
+-    assert!(accounts.offline.is_empty());
+-    let mut accounts = signed_in(&store, &secrets("mc-token", true));
++    // Offline names can be played directly without an owner
+     accounts
+         .play_as(&store, Player::Offline("Builder_1".into()))
+         .unwrap();
+-    // Signing the last owner out keeps the name, which no longer plays.
+-    accounts.remove(&store, UUID).unwrap();
+     assert_eq!(accounts.offline, ["Builder_1"]);
+     assert_eq!(accounts.player(), Player::Offline("Builder_1".into()));
+-    assert!(!accounts.has_owner(&store));
+-    let (_, ep) = mock(|_| {});
+-    assert!(launch(&ep, Some("test-client"), &store, &mut accounts).is_err());
+-    assert!(accounts
+-        .play_as(&store, Player::Offline("Builder_2".into()))
+-        .is_err());
+ }
+ 
+ #[test]
+-fn the_developer_option_off_is_the_owner_gate() {
++fn offline_names_can_be_selected_and_launched() {
+     let store = MemoryStore::default();
+     let mut accounts = Accounts::default();
+-    let refused = accounts.play_as_with(&store, Player::Offline("Builder_1".into()), false);
+-    assert_eq!(refused.unwrap_err(), OFFLINE_NEEDS_OWNER);
+-    assert_eq!(accounts, Accounts::default());
++    accounts
++        .play_as_with(&store, Player::Offline("Builder_1".into()), false)
++        .unwrap();
++    assert_eq!(accounts.offline, ["Builder_1"]);
+     let (_, ep) = mock(|m| m.owns_game = false);
+-    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false);
+-    assert_eq!(refused.unwrap_err(), NoOwner);
+-    let mut accounts = signed_in(&store, &secrets("mc-token", true));
+-    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false);
+-    assert_eq!(refused.unwrap_err(), NoOwner);
++    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).unwrap();
++    assert!(pass.session.is_none());
+ }
+ 
+ #[test]
+diff --git a/launcher/src/backend.rs b/launcher/src/backend.rs
+index 87016f5780..6b2a8defbe 100644
+--- a/launcher/src/backend.rs
++++ b/launcher/src/backend.rs
+@@ -1494,44 +1494,27 @@ fn download_for(
+     pins: &sources::Pins,
+     dir: &Path,
+     pass: Result<account::Launch, account::NoOwner>,
+-    signed_in: bool,
++    _signed_in: bool,
+     fetch: sources::Fetch,
+     log: &dyn Fn(String),
+ ) -> Result<(), String> {
+     let v = &pins.version;
+-    match pass {
++    let name = match pass {
+         Ok(account::Launch {
+-            owner: Some((owner, _)),
++            owner: Some((ref owner, _)),
+             ..
+-        }) => {
+-            let name = owner.name;
+-            log(format!(
+-                "{name} owns Minecraft: downloading {v} from Mojang"
+-            ));
+-            let os = match sources::Os::current() {
+-                sources::Os::Linux => "linux",
+-                sources::Os::MacOs => "osx",
+-                sources::Os::Windows => "windows",
+-            };
+-            mojang::download(pins, dir, os, 8, fetch, &mojang::CANCEL, log).map_err(|e| {
+-                format!("\n  • Horizon tried to download {v} from Mojang for {name}, but: {e}")
+-            })
+-        }
+-        // An owner by its last answer, who can't be asked now.
+-        Ok(pass) => Err(format!(
+-            "\n  • Downloading {v} from Mojang needs your Microsoft account, which could not be \
+-             checked: {}",
+-            pass.offline.unwrap_or_default()
+-        )),
+-        Err(_) if signed_in => Err(
+-            "\n  • No signed-in account owns Minecraft: Java Edition, so Horizon can't download it."
+-                .into(),
+-        ),
+-        Err(_) => Err(format!(
+-            "\n  • Or sign in with the Microsoft account that owns Minecraft: Horizon then \
+-             downloads {v} from Mojang itself."
+-        )),
+-    }
++        }) => format!(" for {}", owner.name),
++        _ => String::new(),
++    };
++    log(format!("Downloading {v} from Mojang{name}"));
++    let os = match sources::Os::current() {
++        sources::Os::Linux => "linux",
++        sources::Os::MacOs => "osx",
++        sources::Os::Windows => "windows",
++    };
++    mojang::download(pins, dir, os, 8, fetch, &mojang::CANCEL, log).map_err(|e| {
++        format!("\n  • Horizon tried to download {v} from Mojang, but: {e}")
++    })
+ }
+ 
+ /// The Java home for this version: a runtime for precompiled exporters, a JDK for older
+@@ -2306,7 +2289,7 @@ pub fn need_prepared(tag: &str) -> Result<(), String> {
+ /// the gate, a sign-in that can't be renewed (no network, expired) still lets the game start,
+ /// offline.
+ pub fn client(tag: &str) -> Result<Command, String> {
+-    let (session, offline) = account::session_for_game(&game_home(), false)
++    let (session, offline) = account::session_for_game(&game_home(), true)
+         .map_err(|refused| format!("{refused} Sign in with `horizon-launcher account sign-in`."))?;
+     need_prepared(tag)?;
+     complete_assets(tag);
+@@ -3225,32 +3208,8 @@ mod tests {
+         };
+         let log = |_: String| {};
+         let no_owner = || Ok(account::Launch::default());
+-        for (pass, signed_in) in [
+-            (Err(account::NoOwner), false),
+-            (Err(account::NoOwner), true),
+-            (no_owner(), false),
+-            (no_owner(), true),
+-        ] {
+-            assert!(download_for(&pins, &dir, pass, signed_in, &fetch, &log).is_err());
+-        }
+-        assert!(asked.lock().unwrap().is_empty());
+-        assert!(!dir.exists());
+-        // An owner: Mojang is asked (and the download fails here, without network).
+-        let owner = account::Account {
+-            uuid: "069a79f444e94726a5befca90e38aaf5".into(),
+-            name: "Notch".into(),
+-            skin: None,
+-            cape: None,
+-        };
+-        let secrets = serde_json::from_str(
+-            r#"{"refresh_token":"r","minecraft_token":"t","minecraft_expires_at":1,"owns":true}"#,
+-        )
+-        .unwrap();
+-        let pass = Ok(account::Launch {
+-            owner: Some((owner, secrets)),
+-            ..Default::default()
+-        });
+-        assert!(download_for(&pins, &dir, pass, true, &fetch, &log).is_err());
++        // Unrestricted: without an owner, download_for still proceeds to download from Mojang.
++        assert!(download_for(&pins, &dir, no_owner(), false, &fetch, &log).is_err());
+         assert!(!asked.lock().unwrap().is_empty());
+         let _ = fs::remove_dir_all(&dir);
+ 
+diff --git a/launcher/src/cli.rs b/launcher/src/cli.rs
+index 725f8bde21..b32b72255f 100644
+--- a/launcher/src/cli.rs
++++ b/launcher/src/cli.rs
+@@ -1695,8 +1695,7 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
+                 }));
+             } else if accounts.accounts.is_empty() && accounts.offline.is_empty() {
+                 println!(
+-                    "No Microsoft account signed in. Play needs one that owns Minecraft: Java \
+-                     Edition: horizon-launcher account sign-in"
++                    "No accounts configured. Play offline as Player, or select an offline name: horizon-launcher account select NAME"
+                 );
+             } else {
+                 for a in &accounts.accounts {
+@@ -1716,9 +1715,6 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
+                         "Playing offline as the game's own name (`account select NAME` to switch)."
+                     );
+                 }
+-                if !accounts.has_owner(account::store()) {
+-                    println!("{}.", account::NEEDS_OWNER);
+-                }
+             }
+         }
+         AccountCmd::SignIn => {
+diff --git a/launcher/src/main.rs b/launcher/src/main.rs
+index 3e242facdc..b82e3fc18c 100644
+--- a/launcher/src/main.rs
++++ b/launcher/src/main.rs
+@@ -797,15 +797,7 @@ impl Launcher {
+                         let mut cmd = backend::client_command(&tag);
+                         let (file, offline) = match session {
+                             Ok(pass) => pass,
+-                            Err(account::NoOwner) => {
+-                                self.owner = Some(false);
+-                                self.owner_screen_open = true;
+-                                self.client_error = Some(format!("{}.", tr(account::NEEDS_OWNER)));
+-                                self.starting_pack = None;
+-                                self.joining = None;
+-                                self.quick_play = None;
+-                                continue;
+-                            }
++                            Err(account::NoOwner) => (None, None),
+                         };
+                         // Past the gate by the developer option alone is no owner.
+                         if !self.settings.dev_offline {
+@@ -1336,7 +1328,7 @@ impl Launcher {
+         self.starting_client = Some(tag.clone());
+         self.play_pressed = Some(Instant::now());
+         let tx = self.tx.clone();
+-        let offline_without_owner = self.settings.dev_offline;
++        let offline_without_owner = true;
+         std::thread::spawn(move || {
+             backend::complete_assets(&tag);
+             let session = account::session_for_game(&backend::game_home(), offline_without_owner);
+@@ -1775,12 +1767,11 @@ enum PlayPress {
+ }
+ 
+ /// `owner`: whether an account here owns the game, by the keychain (`Launcher::owner`).
+-fn play_press(prepared: bool, owner: Option<bool>, busy: bool) -> PlayPress {
+-    match (prepared, owner) {
++fn play_press(prepared: bool, _owner: Option<bool>, busy: bool) -> PlayPress {
++    match prepared {
+         _ if busy => PlayPress::Nothing,
+-        (true, _) => PlayPress::Play,
+-        (false, Some(true)) => PlayPress::PrepareThenPlay,
+-        (false, _) => PlayPress::Nothing,
++        true => PlayPress::Play,
++        false => PlayPress::PrepareThenPlay,
+     }
+ }
+ 
+diff --git a/launcher/src/owner_page.rs b/launcher/src/owner_page.rs
+index 4b8ee5b816..100026de88 100644
+--- a/launcher/src/owner_page.rs
++++ b/launcher/src/owner_page.rs
+@@ -5,20 +5,15 @@
+ use super::*;
+ 
+ impl Launcher {
+-    /// Whether the screen covers the window: no owner, and either Play was refused or the player
+-    /// hasn't read it yet. The data question comes first.
++    /// Whether the screen covers the window: disabled so offline play is never blocked.
+     pub(crate) fn asking_owner(&self) -> bool {
+-        (self.owner_shown() == Some(false) || sign_in_preview())
+-            && (self.owner_screen_open || !self.settings.owner_notice_seen || sign_in_preview())
+-            && !self.asking_consent()
+-            && self.opening.is_none()
++        false
+     }
+ 
+-    /// `owner` as the window shows it: the developer option that lets offline names play without
+-    /// an owner (`dev_options`) hides the gate, as if the keychain hadn't answered yet.
++    /// `owner` as the window shows it: offline play needs no owner, so no refusal banner is shown.
+     pub(crate) fn owner_shown(&self) -> Option<bool> {
+         match self.owner {
+-            Some(false) if self.settings.dev_offline => None,
++            Some(false) => None,
+             owner => owner,
+         }
+     }
+diff --git a/launcher/src/sources.rs b/launcher/src/sources.rs
+index 5c2d31b0cd..e1e3c5df8c 100644
+--- a/launcher/src/sources.rs
++++ b/launcher/src/sources.rs
+@@ -117,10 +117,20 @@ pub fn known_folders(os: Os, f: &Folders) -> Vec<(&'static str, PathBuf)> {
+             (OFFICIAL, f.home.join(".minecraft")),
+             (OFFICIAL, flatpak("com.mojang.Minecraft", ".minecraft")),
+             ("Prism Launcher", f.data.join("PrismLauncher")),
++            ("ElyPrismLauncher", f.data.join("ElyPrismLauncher")),
++            ("PineconeMC", f.data.join("PineconeMC")),
+             (
+                 "Prism Launcher",
+                 flatpak("org.prismlauncher.PrismLauncher", "data/PrismLauncher"),
+             ),
++            (
++                "ElyPrismLauncher",
++                flatpak("org.prismlauncher.ElyPrismLauncher", "data/ElyPrismLauncher"),
++            ),
++            (
++                "PineconeMC",
++                flatpak("org.prismlauncher.PineconeMC", "data/PineconeMC"),
++            ),
+             ("MultiMC", f.data.join("multimc")),
+             ("Modrinth App", f.data.join("ModrinthApp")),
+             (
+@@ -136,6 +146,8 @@ pub fn known_folders(os: Os, f: &Folders) -> Vec<(&'static str, PathBuf)> {
+         Os::MacOs => vec![
+             (OFFICIAL, f.data.join("minecraft")),
+             ("Prism Launcher", f.data.join("PrismLauncher")),
++            ("ElyPrismLauncher", f.data.join("ElyPrismLauncher")),
++            ("PineconeMC", f.data.join("PineconeMC")),
+             ("MultiMC", f.data.join("MultiMC")),
+             ("Modrinth App", f.data.join("ModrinthApp")),
+             ("ATLauncher", f.data.join("ATLauncher")),
+@@ -143,6 +155,8 @@ pub fn known_folders(os: Os, f: &Folders) -> Vec<(&'static str, PathBuf)> {
+         Os::Windows => vec![
+             (OFFICIAL, f.data.join(".minecraft")),
+             ("Prism Launcher", f.data.join("PrismLauncher")),
++            ("ElyPrismLauncher", f.data.join("ElyPrismLauncher")),
++            ("PineconeMC", f.data.join("PineconeMC")),
+             ("Modrinth App", f.data.join("ModrinthApp")),
+             ("ATLauncher", f.data.join("ATLauncher")),
+         ],
+@@ -254,6 +268,8 @@ fn launcher_of(path: &Path) -> Option<&'static str> {
+         .filter_map(|name| name.to_str())
+         .find_map(|name| match name {
+             "PrismLauncher" => Some("Prism Launcher"),
++            "ElyPrismLauncher" => Some("ElyPrismLauncher"),
++            "PineconeMC" => Some("PineconeMC"),
+             "multimc" | "MultiMC" => Some("MultiMC"),
+             "ModrinthApp" | "com.modrinth.theseus" => Some("the Modrinth App"),
+             "atlauncher" | "ATLauncher" => Some("ATLauncher"),
+diff --git a/launcher/tests/owner_gate.rs b/launcher/tests/owner_gate.rs
+index 3a7869272c..91389683d6 100644
+--- a/launcher/tests/owner_gate.rs
++++ b/launcher/tests/owner_gate.rs
+@@ -44,22 +44,19 @@ fn text(out: &Output) -> String {
+ }
+ 
+ #[test]
+-fn the_cli_refuses_to_play_without_an_owner() {
++fn the_cli_allows_play_without_an_owner() {
+     let root = home("cli");
+     let out = launcher(&root, &["play"]).output().unwrap();
+     let said = text(&out);
+-    assert!(!out.status.success(), "{said}");
+-    assert!(said.contains(REFUSED), "{said}");
+-    assert!(said.contains("horizon-launcher account sign-in"), "{said}");
+-    // Nothing of the game ran, and the offline name is still there.
+-    assert!(!root.join("game/sessions").exists());
++    // Offline play is allowed, so it never refuses with REFUSED
++    assert!(!said.contains(REFUSED), "{said}");
+     let accounts = std::fs::read_to_string(root.join("launcher/accounts.json")).unwrap();
+     assert!(accounts.contains("Builder_1"), "{accounts}");
+     let _ = std::fs::remove_dir_all(&root);
+ }
+ 
+ #[test]
+-fn the_mcp_server_refuses_to_play_without_an_owner() {
++fn the_mcp_server_allows_play_without_an_owner() {
+     let root = home("mcp");
+     let mut child = launcher(&root, &["mcp"])
+         .stdin(Stdio::piped())
+@@ -82,8 +79,7 @@ fn the_mcp_server_refuses_to_play_without_an_owner() {
+         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+         .find(|v| v["id"] == 2)
+         .expect("a reply to play");
+-    assert_eq!(reply["result"]["isError"], true, "{reply}");
+-    let said = reply["result"]["content"][0]["text"].as_str().unwrap();
+-    assert!(said.contains(REFUSED), "{said}");
++    let said = reply["result"]["content"][0]["text"].as_str().unwrap_or("");
++    assert!(!said.contains(REFUSED), "{said}");
+     let _ = std::fs::remove_dir_all(&root);
+ }

@@ -1494,44 +1494,27 @@ fn download_for(
     pins: &sources::Pins,
     dir: &Path,
     pass: Result<account::Launch, account::NoOwner>,
-    signed_in: bool,
+    _signed_in: bool,
     fetch: sources::Fetch,
     log: &dyn Fn(String),
 ) -> Result<(), String> {
     let v = &pins.version;
-    match pass {
+    let name = match pass {
         Ok(account::Launch {
-            owner: Some((owner, _)),
+            owner: Some((ref owner, _)),
             ..
-        }) => {
-            let name = owner.name;
-            log(format!(
-                "{name} owns Minecraft: downloading {v} from Mojang"
-            ));
-            let os = match sources::Os::current() {
-                sources::Os::Linux => "linux",
-                sources::Os::MacOs => "osx",
-                sources::Os::Windows => "windows",
-            };
-            mojang::download(pins, dir, os, 8, fetch, &mojang::CANCEL, log).map_err(|e| {
-                format!("\n  • Horizon tried to download {v} from Mojang for {name}, but: {e}")
-            })
-        }
-        // An owner by its last answer, who can't be asked now.
-        Ok(pass) => Err(format!(
-            "\n  • Downloading {v} from Mojang needs your Microsoft account, which could not be \
-             checked: {}",
-            pass.offline.unwrap_or_default()
-        )),
-        Err(_) if signed_in => Err(
-            "\n  • No signed-in account owns Minecraft: Java Edition, so Horizon can't download it."
-                .into(),
-        ),
-        Err(_) => Err(format!(
-            "\n  • Or sign in with the Microsoft account that owns Minecraft: Horizon then \
-             downloads {v} from Mojang itself."
-        )),
-    }
+        }) => format!(" for {}", owner.name),
+        _ => String::new(),
+    };
+    log(format!("Downloading {v} from Mojang{name}"));
+    let os = match sources::Os::current() {
+        sources::Os::Linux => "linux",
+        sources::Os::MacOs => "osx",
+        sources::Os::Windows => "windows",
+    };
+    mojang::download(pins, dir, os, 8, fetch, &mojang::CANCEL, log).map_err(|e| {
+        format!("\n  • Horizon tried to download {v} from Mojang, but: {e}")
+    })
 }
 
 /// The Java home for this version: a runtime for precompiled exporters, a JDK for older
@@ -2306,7 +2289,7 @@ pub fn need_prepared(tag: &str) -> Result<(), String> {
 /// the gate, a sign-in that can't be renewed (no network, expired) still lets the game start,
 /// offline.
 pub fn client(tag: &str) -> Result<Command, String> {
-    let (session, offline) = account::session_for_game(&game_home(), false)
+    let (session, offline) = account::session_for_game(&game_home(), true)
         .map_err(|refused| format!("{refused} Sign in with `horizon-launcher account sign-in`."))?;
     need_prepared(tag)?;
     complete_assets(tag);
@@ -3225,32 +3208,8 @@ mod tests {
         };
         let log = |_: String| {};
         let no_owner = || Ok(account::Launch::default());
-        for (pass, signed_in) in [
-            (Err(account::NoOwner), false),
-            (Err(account::NoOwner), true),
-            (no_owner(), false),
-            (no_owner(), true),
-        ] {
-            assert!(download_for(&pins, &dir, pass, signed_in, &fetch, &log).is_err());
-        }
-        assert!(asked.lock().unwrap().is_empty());
-        assert!(!dir.exists());
-        // An owner: Mojang is asked (and the download fails here, without network).
-        let owner = account::Account {
-            uuid: "069a79f444e94726a5befca90e38aaf5".into(),
-            name: "Notch".into(),
-            skin: None,
-            cape: None,
-        };
-        let secrets = serde_json::from_str(
-            r#"{"refresh_token":"r","minecraft_token":"t","minecraft_expires_at":1,"owns":true}"#,
-        )
-        .unwrap();
-        let pass = Ok(account::Launch {
-            owner: Some((owner, secrets)),
-            ..Default::default()
-        });
-        assert!(download_for(&pins, &dir, pass, true, &fetch, &log).is_err());
+        // Unrestricted: without an owner, download_for still proceeds to download from Mojang.
+        assert!(download_for(&pins, &dir, no_owner(), false, &fetch, &log).is_err());
         assert!(!asked.lock().unwrap().is_empty());
         let _ = fs::remove_dir_all(&dir);
 

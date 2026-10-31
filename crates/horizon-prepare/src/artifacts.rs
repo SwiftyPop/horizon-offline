@@ -192,6 +192,39 @@ fn layouts(folder: &Path, version: &str) -> [GameFiles; 2] {
 fn launcher_folders() -> Vec<(&'static str, PathBuf)> {
     let mut folders = vec![("the official launcher", minecraft_dir(None))];
     // The same folders as the Horizon launcher's (launcher/src/sources.rs `known_folders`).
+    let prism_launchers: Vec<(&'static str, PathBuf)> = if cfg!(target_os = "macos") {
+        let app_support = home().join("Library/Application Support");
+        vec![
+            ("Prism Launcher", app_support.join("PrismLauncher")),
+            ("ElyPrismLauncher", app_support.join("ElyPrismLauncher")),
+            ("PineconeMC", app_support.join("PineconeMC")),
+        ]
+    } else if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map(|d| {
+                let p = PathBuf::from(d);
+                vec![
+                    ("Prism Launcher", p.join("PrismLauncher")),
+                    ("ElyPrismLauncher", p.join("ElyPrismLauncher")),
+                    ("PineconeMC", p.join("PineconeMC")),
+                ]
+            })
+            .unwrap_or_default()
+    } else {
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .filter(|d| !d.is_empty())
+            .map_or_else(|| home().join(".local/share"), PathBuf::from);
+        let flatpak = |app: &str| home().join(".var/app").join(app).join("data");
+        vec![
+            ("Prism Launcher", data.join("PrismLauncher")),
+            ("ElyPrismLauncher", data.join("ElyPrismLauncher")),
+            ("PineconeMC", data.join("PineconeMC")),
+            ("Prism Launcher", flatpak("org.prismlauncher.PrismLauncher").join("PrismLauncher")),
+            ("ElyPrismLauncher", flatpak("org.prismlauncher.ElyPrismLauncher").join("ElyPrismLauncher")),
+            ("PineconeMC", flatpak("org.prismlauncher.PineconeMC").join("PineconeMC")),
+        ]
+    };
+    folders.extend(prism_launchers);
     let atlauncher: Vec<PathBuf> = if cfg!(target_os = "macos") {
         let app = Path::new("Applications/ATLauncher.app/Contents/Java");
         vec![

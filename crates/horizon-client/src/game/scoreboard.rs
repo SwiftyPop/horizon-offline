@@ -696,7 +696,11 @@ impl Game<'_> {
                 });
                 let mut me = TabPlayer::new(uuid, PLAYER_NAME);
                 me.game_mode = self.mode_id();
-                me.skin = "entity/player/wide/steve".into();
+                me.skin = if self.gui.atlas.sprites.contains_key("skins/local_offline") {
+                    "skins/local_offline".into()
+                } else {
+                    "entity/player/wide/steve".into()
+                };
                 let guests = self.lan.as_ref().map_or(&[][..], |h| &h.hub.guests);
                 let players = local_tab_players(me, guests);
                 let upside_down = players
