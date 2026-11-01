@@ -1,0 +1,216 @@
+name: Nightly Offline Build
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'patches/**'
+      - '.github/workflows/**'
+      - 'launcher/**'
+      - 'crates/**'
+  schedule:
+    # Run every day at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force a build even if no new upstream commits are detected'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-offline
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync Upstream & Apply Patch
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      upstream_short: ${{ steps.sync.outputs.upstream_short }}
+      date: ${{ steps.date.outputs.date }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Set current date
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Git Author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch Upstream
+        id: sync
+        run: |
+          git remote add upstream https://github.com/horizon-rust/horizon.git || git remote set-url upstream https://github.com/horizon-rust/horizon.git
+          git fetch upstream main
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          UPSTREAM_SHORT=$(git rev-parse --short upstream/main)
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=$UPSTREAM_SHORT" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream commit is $UPSTREAM_SHORT ($UPSTREAM_SHA)"
+
+      - name: Check if build needed
+        id: check
+        run: |
+          if [[ "${{ inputs.force_build }}" == "true" || "${{ github.event_name }}" == "push" ]]; then
+            echo "Force build requested."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Upstream main is already integrated in HEAD. No new upstream commits."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream commits detected or update needed."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply Offline Patch to Upstream Main
+        if: steps.check.outputs.should_build == 'true'
+        id: patch
+        run: |
+          # 1. Back up workflow and patch to temp directory before switching branches
+          mkdir -p "$RUNNER_TEMP/sync_backup"
+          cp -r patches "$RUNNER_TEMP/sync_backup/"
+          cp .github/workflows/nightly-offline.yml "$RUNNER_TEMP/sync_backup/"
+          
+          # 2. Checkout a new branch from upstream/main
+          git checkout -B sync-upstream upstream/main
+          
+          # 3. Restore workflow and patch folder onto the new branch
+          cp -r "$RUNNER_TEMP/sync_backup/patches" .
+          mkdir -p .github/workflows
+          cp "$RUNNER_TEMP/sync_backup/nightly-offline.yml" .github/workflows/
+          
+          # 4. Apply the offline patch with 3-way merge fallback
+          if git apply -3 patches/offline-account-and-elyprism.patch; then
+            echo "Offline patch applied cleanly!"
+            git add -A
+            git commit -m "Auto-sync upstream $(git rev-parse --short upstream/main) and apply offline patch"
+            git branch -f main sync-upstream
+            git checkout main
+            git push origin main --force
+          else
+            echo "::error::Patch failed to apply cleanly to latest upstream/main!"
+            echo "### ⚠️ Upstream Sync Conflict" >> $GITHUB_STEP_SUMMARY
+            echo "The patch \`patches/offline-account-and-elyprism.patch\` failed to apply cleanly to upstream commit \`${{ steps.sync.outputs.upstream_sha }}\`." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            artifact_name: horizon-launcher-windows-x64.zip
+            binary_name: horizon-launcher.exe
+            rustflags: -C target-feature=+crt-static
+          - name: linux
+            os: ubuntu-22.04
+            artifact_name: horizon-launcher-linux-x86_64.tar.gz
+            binary_name: horizon-launcher
+            rustflags: ""
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher
+          shared-key: launcher-${{ matrix.name }}
+
+      - name: Install Linux GUI / Audio Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev libasound2-dev
+
+      - name: Build Launcher
+        working-directory: launcher
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release
+
+      - name: Package Artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "launcher/target/release/${{ matrix.binary_name }}" -DestinationPath "${{ matrix.artifact_name }}"
+
+      - name: Package Artifact (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          tar -czf "${{ matrix.artifact_name }}" -C launcher/target/release "${{ matrix.binary_name }}"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-build
+          path: ${{ matrix.artifact_name }}
+          retention-days: 7
+
+  release:
+    name: Publish Nightly Release
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Inspect artifacts
+        run: ls -la release-artifacts
+
+      - name: Create or Update Nightly Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Horizon Offline Nightly (${{ needs.sync.outputs.date }})
+          body: |
+            ## Horizon Offline Nightly Build (${{ needs.sync.outputs.date }})
+            
+            Automated build with offline account support and ElyPrismLauncher / PineconeMC asset discovery.
+            
+            - **Upstream commit:** [`${{ needs.sync.outputs.upstream_short }}`](https://github.com/horizon-rust/horizon/commit/${{ needs.sync.outputs.upstream_sha }})
+            - **Build Date:** ${{ needs.sync.outputs.date }}
+            
+            ### Included Changes:
+            - Offline account mode with custom usernames (no Microsoft login required)
+            - Fallback Mojang unauthenticated asset resolution & local launcher discovery (ElyPrismLauncher, PineconeMC, Prism, MultiMC, Modrinth)
+            - Offline skin loading via `HORIZON_OFFLINE_SKIN` & `HORIZON_OFFLINE_SKIN_MODEL`
+          draft: false
+          prerelease: true
+          files: |
+            release-artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

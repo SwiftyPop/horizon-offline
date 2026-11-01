@@ -375,17 +375,40 @@ impl Game<'_> {
             .as_mut()
             .and_then(|p| p.attribute("minecraft:scale").ok())
             .unwrap_or(1.0) as f32;
-        let Some(p) = self.player.as_ref() else {
+        if self.player.is_none() {
             self.player_model = None;
+            return;
+        }
+        if let Ok(skin_path) = std::env::var("HORIZON_OFFLINE_SKIN") {
+            let location = "skins/local_offline".to_string();
+            if !self.gui.atlas.sprites.contains_key(&location) {
+                if let Ok(bytes) = std::fs::read(&skin_path) {
+                    if let Ok((w, h, rgba)) = horizon_client::hud::decode_bytes(&bytes) {
+                        if let Some(processed) = horizon_client::skins::process_legacy_skin(w, h, &rgba) {
+                            self.store_skin(location.clone(), processed);
+                        }
+                    }
+                }
+            }
+        }
+        let Some(p) = self.player.as_ref() else {
             return;
         };
         if self.player_model.is_none() {
             let Some(kind) = self.res.player_type().clone() else {
                 return;
             };
-            let mut m = Mob::new(0, kind, p.position, self.yaw);
-            m.head_pitch = self.pitch;
-            self.player_model = Some(m);
+            let mut mob = Mob::new(0, kind, p.position, self.yaw);
+            mob.head_pitch = self.pitch;
+            let location = "skins/local_offline";
+            if self.gui.atlas.sprites.contains_key(location) {
+                let slim = std::env::var("HORIZON_OFFLINE_SKIN_MODEL")
+                    .map(|m| m == "slim")
+                    .unwrap_or(false);
+                mob.skin = Some(location.to_string());
+                mob.slim = slim;
+            }
+            self.player_model = Some(mob);
         }
         let pose = p.pose;
         let crouching = pose == Pose::Crouching;

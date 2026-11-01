@@ -4699,7 +4699,6 @@ impl Game<'_> {
             .collect();
         Some((players, r.online_mode, upside_down))
     }
-
     /// Resolve inline `object:player` profiles through the same skin cache as
     /// player heads on items. The next frame uses the uploaded atlas texture.
     pub(super) fn resolve_inline_profiles(&mut self, profiles: &[serde_json::Value]) {
@@ -4764,6 +4763,7 @@ impl Game<'_> {
             }
             OwnProfile::Done(_) => {}
         }
+    }
     }
     /// `PlayerInfo.getSkin` for every player entity, including NPCs that are
     /// never in the tab list: resolve each profile's textures and give the
@@ -4890,8 +4890,31 @@ impl Game<'_> {
             mob.slim = is_slim;
             mob.cape = cape;
         }
+        let mut offline_skin = None;
+        if skins.get(&own).is_none() && let Ok(skin_path) = std::env::var("HORIZON_OFFLINE_SKIN") {
+            let location = "skins/local_offline".to_string();
+            if !self.gui.atlas.sprites.contains_key(&location) {
+                if let Ok(bytes) = std::fs::read(&skin_path) {
+                    if let Ok((w, h, rgba)) = horizon_client::hud::decode_bytes(&bytes) {
+                        if let Some(processed) = horizon_client::skins::process_legacy_skin(w, h, &rgba) {
+                            self.store_skin(location.clone(), processed);
+                        }
+                    }
+                }
+            }
+            if self.gui.atlas.sprites.contains_key(&location) {
+                let slim = std::env::var("HORIZON_OFFLINE_SKIN_MODEL")
+                    .map(|m| m == "slim")
+                    .unwrap_or(false);
+                offline_skin = Some((location, slim));
+            }
+        }
         if self.player_model.is_some() {
-            let (skin, is_slim) = self.drawn_skin(own, skin_of(&skins, own));
+            let (skin, is_slim) = if let Some((loc, slim)) = offline_skin {
+                (loc, slim)
+            } else {
+                self.drawn_skin(own, skin_of(&skins, own))
+            };
             // Avatar.isModelPartShown(CAPE): the Skin Customization option.
             let cape = capes
                 .get(&own)

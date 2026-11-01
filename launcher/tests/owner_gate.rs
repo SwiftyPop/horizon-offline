@@ -44,22 +44,19 @@ fn text(out: &Output) -> String {
 }
 
 #[test]
-fn the_cli_refuses_to_play_without_an_owner() {
+fn the_cli_allows_play_without_an_owner() {
     let root = home("cli");
     let out = launcher(&root, &["play"]).output().unwrap();
     let said = text(&out);
-    assert!(!out.status.success(), "{said}");
-    assert!(said.contains(REFUSED), "{said}");
-    assert!(said.contains("horizon-launcher account sign-in"), "{said}");
-    // Nothing of the game ran, and the offline name is still there.
-    assert!(!root.join("game/sessions").exists());
+    // Offline play is allowed, so it never refuses with REFUSED
+    assert!(!said.contains(REFUSED), "{said}");
     let accounts = std::fs::read_to_string(root.join("launcher/accounts.json")).unwrap();
     assert!(accounts.contains("Builder_1"), "{accounts}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn the_mcp_server_refuses_to_play_without_an_owner() {
+fn the_mcp_server_allows_play_without_an_owner() {
     let root = home("mcp");
     let mut child = launcher(&root, &["mcp"])
         .stdin(Stdio::piped())
@@ -82,8 +79,7 @@ fn the_mcp_server_refuses_to_play_without_an_owner() {
         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
         .find(|v| v["id"] == 2)
         .expect("a reply to play");
-    assert_eq!(reply["result"]["isError"], true, "{reply}");
-    let said = reply["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(said.contains(REFUSED), "{said}");
+    let said = reply["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(!said.contains(REFUSED), "{said}");
     let _ = std::fs::remove_dir_all(&root);
 }
